@@ -90,6 +90,7 @@ pub mod mdns;
     any(esp_idf_comp_mqtt_enabled, esp_idf_comp_espressif__mqtt_enabled),
     esp_idf_comp_esp_event_enabled
 ))]
+pub mod modem;
 pub mod mqtt;
 #[cfg(esp_idf_lwip_ipv4_napt)]
 pub mod napt;

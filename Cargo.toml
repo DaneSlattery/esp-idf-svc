@@ -57,6 +57,7 @@ embassy-time-queue-utils = { version = "0.3", optional = true }
 embassy-futures = "0.1.2"
 embedded-storage = { version = "0.3", optional = true }
 futures-io = { version = "0.3", optional = true }
+at-commands = "0.5.4"
 
 [build-dependencies]
 embuild = "0.33.3"
