@@ -1,415 +1,133 @@
-use crate::{
-    handle::RawHandle,
-    netif::{PppConfiguration, PppEvent},
+//! SIM7600 PPP-over-serial integration for ESP-NETIF/lwIP.
+
+use core::time::Duration;
+use std::{
+    ffi::CString,
+    string::String,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Condvar, Mutex,
+    },
+    time::Instant,
+    vec::Vec,
 };
-use core::{
-    borrow::{Borrow, BorrowMut},
-    cell::RefCell,
-    marker::PhantomData,
-};
+
+use embedded_svc::io::{ErrorType, Write};
+use enumset::EnumSet;
 use esp_idf_hal::{
-    delay::BLOCK,
-    io::{Error, EspIOError},
-    uart::{UartDriver, UartTxDriver},
+    delay::{FreeRtos, TickType},
+    io::EspIOError,
+    uart::UartRxDriver,
 };
-use std::{boxed::Box, rc::Rc, sync::Arc};
 
 use crate::{
-    eventloop::{EspEventLoop, EspSubscription, EspSystemEventLoop, System},
-    netif::{EspNetif, EspNetifDriver, NetifStack},
-    private::mutex,
-    sys::*,
+    eventloop::{EspSubscription, EspSystemEventLoop, System},
+    handle::RawHandle,
+    ipv4,
+    netif::{
+        EspNetif, EspNetifDriver, IpEvent, NetifStack, PppAuthentication, PppConfiguration,
+        PppEvent,
+    },
+    sys::{EspError, ESP_ERR_TIMEOUT},
 };
 
-/// Unable to bypass the current buffered reader or writer because there are buffered bytes.
-#[derive(Debug)]
-pub struct BypassError;
+const READ_POLL: Duration = Duration::from_millis(100);
+const ESCAPE_GUARD_MS: u32 = 1100;
 
-/// A buffered [`Read`]
-///
-/// The BufferedRead will read into the provided buffer to avoid small reads to the inner reader.
-pub struct BufferedRead<'buf, T: embedded_svc::io::Read> {
-    inner: T,
-    buf: &'buf mut [u8],
-    offset: usize,
-    available: usize,
+/// A UART-like reader which returns `Ok(0)` when its timeout expires.
+pub trait TimedRead: ErrorType {
+    fn read_timeout(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<usize, Self::Error>;
 }
 
-impl<'buf, T: embedded_svc::io::Read> BufferedRead<'buf, T> {
-    /// Create a new buffered reader
-    pub fn new(inner: T, buf: &'buf mut [u8]) -> Self {
-        Self {
-            inner,
-            buf,
-            offset: 0,
-            available: 0,
+impl TimedRead for UartRxDriver<'_> {
+    fn read_timeout(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<usize, Self::Error> {
+        match UartRxDriver::read(self, buffer, TickType::from(timeout).ticks()) {
+            Ok(len) => Ok(len),
+            Err(error) if error.code() == ESP_ERR_TIMEOUT => Ok(0),
+            Err(error) => Err(EspIOError(error)),
         }
-    }
-
-    /// Create a new buffered reader with the first `available` bytes readily available at `offset`.
-    ///
-    /// This is useful if for some reason the inner reader was previously consumed by a greedy reader
-    /// in a way such that the BufferedRead must inherit these excess bytes.
-    pub fn new_with_data(inner: T, buf: &'buf mut [u8], offset: usize, available: usize) -> Self {
-        assert!(offset + available <= buf.len());
-        Self {
-            inner,
-            buf,
-            offset,
-            available,
-        }
-    }
-
-    /// Get whether there are any bytes readily available
-    pub fn is_empty(&self) -> bool {
-        self.available == 0
-    }
-
-    /// Get the number of bytes that are readily availbale
-    pub fn available(&self) -> usize {
-        self.available
-    }
-
-    /// Get the inner reader if there are no currently buffered, available bytes
-    pub fn bypass(&mut self) -> Result<&mut T, BypassError> {
-        match self.available {
-            0 => Ok(&mut self.inner),
-            _ => Err(BypassError),
-        }
-    }
-
-    /// Release and get the inner reader
-    pub fn release(self) -> T {
-        self.inner
-    }
-}
-
-impl<T: embedded_svc::io::Read> embedded_svc::io::ErrorType for BufferedRead<'_, T> {
-    type Error = T::Error;
-}
-
-impl<T: embedded_svc::io::Read + embedded_svc::io::Write> embedded_svc::io::Write
-    for BufferedRead<'_, T>
-{
-    fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        self.inner.write(buf)
-    }
-
-    fn write_all(&mut self, buf: &[u8]) -> Result<(), Self::Error> {
-        self.inner.write_all(buf)
-    }
-
-    fn flush(&mut self) -> Result<(), Self::Error> {
-        self.inner.flush()
-    }
-}
-
-impl<T: embedded_svc::io::Read> embedded_svc::io::Read for BufferedRead<'_, T> {
-    fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
-        if self.available == 0 {
-            if buf.len() >= self.buf.len() {
-                // Fast path - bypass local buffer
-                return self.inner.read(buf);
-            }
-            self.offset = 0;
-            self.available = self.inner.read(self.buf)?;
-        }
-
-        let len = usize::min(self.available, buf.len());
-        buf[..len].copy_from_slice(&self.buf[self.offset..self.offset + len]);
-        if len < self.available {
-            // There are still bytes left
-            self.offset += len;
-            self.available -= len;
-        } else {
-            // The buffer is drained
-            self.available = 0;
-        }
-
-        Ok(len)
-    }
-}
-
-impl<T: embedded_svc::io::Read> embedded_svc::io::BufRead for BufferedRead<'_, T> {
-    fn fill_buf(&mut self) -> Result<&[u8], Self::Error> {
-        if self.available == 0 {
-            self.offset = 0;
-            self.available = self.inner.read(self.buf)?;
-        }
-
-        Ok(&self.buf[self.offset..self.offset + self.available])
-    }
-
-    fn consume(&mut self, amt: usize) {
-        assert!(amt <= self.available);
-        self.offset += amt;
-        self.available -= amt;
-    }
-}
-
-pub struct EspModem<'d, T, R, E>
-where
-    T: embedded_svc::io::Write<Error = E> + Send,
-    R: embedded_svc::io::Read<Error = E>,
-    EspIOError: From<E>,
-{
-    writer: Arc<mutex::Mutex<T>>,
-    reader: Arc<mutex::Mutex<R>>,
-    status: Arc<mutex::Mutex<ModemDriverStatus>>,
-    _subscription: EspSubscription<'static, System>,
-    netif: Arc<mutex::Mutex<EspNetif>>,
-    _d: PhantomData<&'d ()>,
-}
-
-impl<'d, T, R, E> EspModem<'d, T, R, E>
-where
-    T: embedded_svc::io::Write<Error = E> + Send,
-    R: embedded_svc::io::Read<Error = E>,
-    EspIOError: From<E>, // EspError: From<<T as embedded_svc::io::ErrorType>::Error>,
-                         // EspError: From<<R as embedded_svc::io::ErrorType>::Error>,
-{
-    pub fn new(writer: T, reader: R, sysloop: EspSystemEventLoop) -> Result<Self, EspError> {
-        let (status, subscription) = Self::subscribe(&sysloop)?;
-
-        Ok(Self {
-            writer: Arc::new(mutex::Mutex::new(writer)),
-            reader: Arc::new(mutex::Mutex::new(reader)),
-            status,
-            _subscription: subscription,
-            netif: Arc::new(mutex::Mutex::new(EspNetif::new(NetifStack::Ppp)?)),
-            _d: PhantomData,
-        })
-    }
-
-    /// Run the modem network interface. Blocks until the PPP encounters an error.
-    pub fn run(&self, buffer: &mut [u8]) -> Result<(), EspError> {
-        self.status.lock().running = true;
-
-        // now in ppp mode.
-
-        let handle = self.netif.as_ref().lock().handle();
-        esp!(unsafe {
-            esp_event_handler_register(
-                IP_EVENT,
-                ESP_EVENT_ANY_ID as _,
-                Some(Self::raw_on_ip_event),
-                handle as *mut core::ffi::c_void,
-            )
-        })?;
-
-        let netif = Arc::clone(&self.netif);
-        let mut netif = (*netif).lock();
-        let netif = (*netif).borrow_mut();
-
-        let writer = self.writer.clone();
-        let driver = EspNetifDriver::new_nonstatic(
-            netif,
-            move |x| {
-                x.set_ppp_conf(&PppConfiguration {
-                    phase_events_enabled: true,
-                    error_events_enabled: true,
-                })
-            },
-            move |data| Self::tx(writer.clone(), data),
-        )?;
-
-        loop {
-            if !self.status.lock().running {
-                break;
-            }
-            let len = self
-                .reader
-                .lock()
-                .read(buffer)
-                .map_err(|w| Into::<EspIOError>::into(w).0)?;
-
-            if len > 0 {
-                driver.rx(&buffer[..len])?;
-            }
-        }
-
-        Ok(())
-    }
-
-    /// Returns the current [`ModemPPPError`] status, if any.
-    pub fn get_error(&self) -> Option<ModemPPPError> {
-        self.status.lock().error.clone()
-    }
-
-    /// Returns the current [`ModemPhaseStatus`]
-    pub fn get_phase_status(&self) -> ModemPhaseStatus {
-        self.status.lock().phase.clone()
-    }
-    pub fn is_connected(&self) -> Result<bool, EspError> {
-        let netif = (*self.netif).borrow();
-        netif.lock().is_up()
-    }
-    // /// Returns the underlying [`EspNetif`]
-    // pub fn netif(&self) -> &EspNetif {
-    //     &self.netif.borrow()
-    // }
-
-    // /// Returns the underlying [`EspNetif`], as mutable
-    // pub fn netif_mut(&mut self) -> &mut EspNetif {
-    //     &mut self.netif
-    // }
-
-    /// Callback given to the LWIP API to write data to the PPP server.
-    fn tx(writer: Arc<mutex::Mutex<T>>, data: &[u8]) -> Result<(), EspError> {
-        writer
-            .lock()
-            .write_all(data)
-            .map_err(|w| Into::<EspIOError>::into(w).0)?;
-
-        Ok(())
-    }
-
-    fn subscribe(
-        sysloop: &EspEventLoop<System>,
-    ) -> Result<
-        (
-            Arc<mutex::Mutex<ModemDriverStatus>>,
-            EspSubscription<'static, System>,
-        ),
-        EspError,
-    > {
-        let status = Arc::new(mutex::Mutex::new(ModemDriverStatus {
-            error: None,
-            phase: ModemPhaseStatus::Disconnect,
-            running: false,
-        }));
-
-        let s_status = status.clone();
-
-        let subscription = sysloop.subscribe::<PppEvent, _>(move |event| {
-            let mut guard = s_status.lock();
-            log::info!("Got event PPP: {:?}", event);
-            match event {
-                PppEvent::NoError => guard.error = None,
-                PppEvent::ParameterError => guard.error = Some(ModemPPPError::Parameter),
-                PppEvent::OpenError => guard.error = Some(ModemPPPError::Open),
-                PppEvent::DeviceError => guard.error = Some(ModemPPPError::Device),
-                PppEvent::AllocError => guard.error = Some(ModemPPPError::Alloc),
-                PppEvent::UserError => guard.error = Some(ModemPPPError::User),
-                PppEvent::DisconnectError => guard.error = Some(ModemPPPError::Disconnect),
-                PppEvent::AuthFailError => guard.error = Some(ModemPPPError::AuthFail),
-                PppEvent::ProtocolError => guard.error = Some(ModemPPPError::Protocol),
-                PppEvent::PeerDeadError => guard.error = Some(ModemPPPError::PeerDead),
-                PppEvent::IdleTimeoutError => guard.error = Some(ModemPPPError::IdleTimeout),
-                PppEvent::MaxConnectTimeoutError => {
-                    guard.error = Some(ModemPPPError::MaxConnectTimeout)
-                }
-                PppEvent::LoopbackError => guard.error = Some(ModemPPPError::Loopback),
-                PppEvent::PhaseDead => guard.phase = ModemPhaseStatus::Dead,
-                PppEvent::PhaseMaster => guard.phase = ModemPhaseStatus::Master,
-                PppEvent::PhaseHoldoff => guard.phase = ModemPhaseStatus::Holdoff,
-                PppEvent::PhaseInitialize => guard.phase = ModemPhaseStatus::Initialize,
-                PppEvent::PhaseSerialConnection => guard.phase = ModemPhaseStatus::SerialConnection,
-                PppEvent::PhaseDormant => guard.phase = ModemPhaseStatus::Dormant,
-                PppEvent::PhaseEstablish => guard.phase = ModemPhaseStatus::Establish,
-                PppEvent::PhaseAuthenticate => guard.phase = ModemPhaseStatus::Authenticate,
-                PppEvent::PhaseCallback => guard.phase = ModemPhaseStatus::Callback,
-                PppEvent::PhaseNetwork => guard.phase = ModemPhaseStatus::Network,
-                PppEvent::PhaseRunning => guard.phase = ModemPhaseStatus::Running,
-                PppEvent::PhaseTerminate => guard.phase = ModemPhaseStatus::Terminate,
-                PppEvent::PhaseDisconnect => guard.phase = ModemPhaseStatus::Disconnect,
-                PppEvent::PhaseFailed => guard.phase = ModemPhaseStatus::Failed,
-            }
-        })?;
-
-        Ok((status, subscription))
-    }
-
-    fn on_ip_event(event_id: u32, event_data: *mut ::core::ffi::c_void) {
-        use log::info;
-        info!("Got event id: {}", event_id);
-
-        if event_id == ip_event_t_IP_EVENT_PPP_GOT_IP {
-            let mut dns_info = esp_netif_dns_info_t::default();
-            let event_data = unsafe { (event_data as *const ip_event_got_ip_t).as_ref() }.unwrap();
-            info!(" ip_info = {:?} ", event_data.ip_info);
-            info!("modem connected to ppp server, info: {:?}", event_data);
-
-            let netif = event_data.esp_netif;
-            esp!(unsafe { esp_netif_get_dns_info(netif, 0, &mut dns_info) }).unwrap();
-            info!(" dns_info = {:?} ", unsafe { dns_info.ip.u_addr.ip4.addr });
-        } else if event_id == ip_event_t_IP_EVENT_PPP_LOST_IP {
-            info!("Modem disconnected from ppp server");
-        }
-    }
-
-    unsafe extern "C" fn raw_on_ip_event(
-        _event_handler_arg: *mut ::core::ffi::c_void,
-        _event_base: esp_event_base_t,
-        event_id: i32,
-        event_data: *mut ::core::ffi::c_void,
-    ) {
-        Self::on_ip_event(event_id as _, event_data)
-    }
-}
-
-unsafe impl<T, R, E> Send for EspModem<'_, T, R, E>
-where
-    T: embedded_svc::io::Write<Error = E> + Send,
-    R: embedded_svc::io::Read<Error = E>,
-    EspIOError: From<E>,
-{
-}
-
-unsafe impl<T, R, E> Sync for EspModem<'_, T, R, E>
-where
-    T: embedded_svc::io::Write<Error = E> + Send,
-    R: embedded_svc::io::Read<Error = E>,
-    EspIOError: From<E>,
-{
-}
-
-impl<'d, T, R, E> Drop for EspModem<'d, T, R, E>
-where
-    T: embedded_svc::io::Write<Error = E> + Send,
-    R: embedded_svc::io::Read<Error = E>,
-    EspIOError: From<E>,
-{
-    fn drop(&mut self) {
-        esp!(unsafe {
-            esp_event_handler_unregister(
-                IP_EVENT,
-                ESP_EVENT_ANY_ID as _,
-                Some(Self::raw_on_ip_event),
-            )
-        })
-        .unwrap();
     }
 }
 
 #[derive(Clone, Debug)]
-pub enum ModemPPPError {
-    ///  Invalid parameter.
-    Parameter,
-    ///  Unable to open PPP session.
-    Open,
-    ///  Invalid I/O device for PPP.
-    Device,
-    ///  Unable to allocate resources.
-    Alloc,
-    ///  User interrupt.
-    User,
-    ///  Connection lost.
-    Disconnect,
-    ///  Failed authentication challenge.
-    AuthFail,
-    ///  Failed to meet protocol.
-    Protocol,
-    ///  Connection timeout
-    PeerDead,
-    ///  Idle Timeout
-    IdleTimeout,
-    ///  Max connect time reached
-    MaxConnectTimeout,
-    ///  Loopback detected
-    Loopback,
+pub struct ModemConfig {
+    pub apn: String,
+    pub pin: Option<String>,
+    pub authentication: Option<PppAuthConfig>,
+    pub command_timeout: Duration,
+    pub registration_timeout: Duration,
+    pub dial_timeout: Duration,
+    pub ppp_timeout: Duration,
+    pub shutdown_timeout: Duration,
+    pub retry_delays: Vec<Duration>,
 }
+
+impl ModemConfig {
+    pub fn new(apn: impl Into<String>) -> Self {
+        Self {
+            apn: apn.into(),
+            pin: None,
+            authentication: None,
+            command_timeout: Duration::from_secs(5),
+            registration_timeout: Duration::from_secs(180),
+            dial_timeout: Duration::from_secs(60),
+            ppp_timeout: Duration::from_secs(60),
+            shutdown_timeout: Duration::from_secs(30),
+            retry_delays: vec![
+                Duration::from_secs(2),
+                Duration::from_secs(5),
+                Duration::from_secs(10),
+            ],
+        }
+    }
+
+    fn validate(&self) -> Result<(), ModemError> {
+        validate_at_argument("APN", &self.apn)?;
+        if self.apn.is_empty() {
+            return Err(ModemError::Configuration("APN cannot be empty".into()));
+        }
+        if let Some(pin) = &self.pin {
+            validate_at_argument("PIN", pin)?;
+        }
+        if let Some(auth) = &self.authentication {
+            if auth.username.as_bytes().contains(&0) || auth.password.as_bytes().contains(&0) {
+                return Err(ModemError::Configuration(
+                    "PPP credentials cannot contain NUL".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug)]
+pub struct PppAuthConfig {
+    pub protocol: PppAuthProtocol,
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum PppAuthProtocol {
+    Pap,
+    Chap,
+    PapOrChap,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModemState {
+    Initializing,
+    Registering,
+    Dialing,
+    NegotiatingPpp,
+    Connected,
+    Recovering,
+    Stopping,
+    Stopped,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ModemPhaseStatus {
     Dead,
     Master,
@@ -427,448 +145,783 @@ pub enum ModemPhaseStatus {
     Failed,
 }
 
-#[derive(Clone, Debug)]
-pub struct ModemDriverStatus {
-    pub error: Option<ModemPPPError>,
-    pub phase: ModemPhaseStatus,
-    pub running: bool,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ModemPPPError {
+    Parameter,
+    Open,
+    Device,
+    Alloc,
+    User,
+    Disconnect,
+    AuthFail,
+    Protocol,
+    PeerDead,
+    IdleTimeout,
+    MaxConnectTimeout,
+    Loopback,
 }
 
-pub mod sim {
-    //! SimModem
-    //!
-    //! Models a modem device with a sim card able to serve as a
-    //! network interface for the host.
+#[derive(Clone, Debug)]
+pub enum ModemError {
+    Configuration(String),
+    Io,
+    At(String),
+    Timeout(&'static str),
+    BufferOverflow,
+    SimPinRequired,
+    SimPinRejected,
+    RegistrationDenied,
+    Ppp(ModemPPPError),
+    ConnectionLost,
+    RecoveryRequired,
+    ShutdownTimeout,
+    Esp(EspError),
+}
 
-    use embedded_svc::io::{BufRead, Read, Write};
-
-    /// The generic device trait. Implementations of this trait should provide
-    /// relevant AT commands and confirm the modem replies to drive the modem
-    /// into PPPoS (data mode).
-    pub trait SimModem {
-        /// The current mode of the sim modem.
-        fn get_mode(&self) -> &CommunicationMode;
-
-        /// Initialise the remote modem so that it is in PPPoS mode.
-        fn negotiate<T: Write, R: BufRead + Read>(
-            &mut self,
-            tx: &mut T,
-            rx: &mut R,
-        ) -> Result<(), ModemError>;
+impl ModemError {
+    fn retryable(&self) -> bool {
+        !matches!(
+            self,
+            Self::Configuration(_)
+                | Self::SimPinRequired
+                | Self::SimPinRejected
+                | Self::RegistrationDenied
+                | Self::RecoveryRequired
+                | Self::ShutdownTimeout
+                | Self::Ppp(ModemPPPError::AuthFail)
+        )
     }
+}
 
-    /// State of the modem.
-    ///
-    /// In [CommunicationMode::Command] mode, AT commands will function,
-    /// serving to put the modem into [CommunicationMode::Data].
-    ///
-    /// In [CommunicationMode::Data] the modem device will act as a Point-To-Point over Serial (PPPoS)
-    /// server.
-    pub enum CommunicationMode {
-        Command,
-        Data,
+impl core::fmt::Display for ModemError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Configuration(message) => write!(f, "invalid modem configuration: {message}"),
+            Self::Io => f.write_str("modem transport I/O failed"),
+            Self::At(message) => write!(f, "modem rejected command: {message}"),
+            Self::Timeout(operation) => write!(f, "timed out while {operation}"),
+            Self::BufferOverflow => f.write_str("AT response exceeded the receive buffer"),
+            Self::SimPinRequired => f.write_str("SIM requires a PIN"),
+            Self::SimPinRejected => f.write_str("SIM PIN was rejected"),
+            Self::RegistrationDenied => f.write_str("cellular registration was denied"),
+            Self::Ppp(error) => write!(f, "PPP failed: {error:?}"),
+            Self::ConnectionLost => f.write_str("PPP connection was lost"),
+            Self::RecoveryRequired => f.write_str("modem requires a hardware reset"),
+            Self::ShutdownTimeout => f.write_str("PPP did not stop before its deadline"),
+            Self::Esp(error) => write!(f, "ESP-IDF error: {error}"),
+        }
     }
+}
 
-    #[derive(Debug)]
-    pub enum ModemError {
-        IO,
-        ATParse(at_commands::parser::ParseError),
-        ATBuild(usize),
+impl std::error::Error for ModemError {}
+
+impl From<EspError> for ModemError {
+    fn from(value: EspError) -> Self {
+        Self::Esp(value)
     }
+}
 
-    impl std::fmt::Display for ModemError {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            write!(f, "{:?}", self)
+#[derive(Clone, Debug)]
+pub struct ModemStatus {
+    pub state: ModemState,
+    pub phase: ModemPhaseStatus,
+    pub ip_info: Option<ipv4::IpInfo>,
+    pub last_error: Option<ModemError>,
+}
+
+struct SharedStatus {
+    status: Mutex<ModemStatus>,
+    changed: Condvar,
+    stop: AtomicBool,
+    ppp_error: Mutex<Option<ModemPPPError>>,
+}
+
+impl SharedStatus {
+    fn new() -> Self {
+        Self {
+            status: Mutex::new(ModemStatus {
+                state: ModemState::Stopped,
+                phase: ModemPhaseStatus::Dead,
+                ip_info: None,
+                last_error: None,
+            }),
+            changed: Condvar::new(),
+            stop: AtomicBool::new(false),
+            ppp_error: Mutex::new(None),
         }
     }
 
-    impl std::error::Error for ModemError {}
+    fn update(&self, update: impl FnOnce(&mut ModemStatus)) {
+        update(&mut self.status.lock().unwrap());
+        self.changed.notify_all();
+    }
+}
 
-    impl From<usize> for ModemError {
-        fn from(value: usize) -> Self {
-            ModemError::ATBuild(value)
-        }
+#[derive(Clone)]
+pub struct ModemHandle {
+    shared: Arc<SharedStatus>,
+}
+
+impl ModemHandle {
+    pub fn status(&self) -> ModemStatus {
+        self.shared.status.lock().unwrap().clone()
     }
 
-    impl From<at_commands::parser::ParseError> for ModemError {
-        fn from(value: at_commands::parser::ParseError) -> Self {
-            ModemError::ATParse(value)
-        }
+    pub fn request_stop(&self) {
+        self.shared.stop.store(true, Ordering::SeqCst);
+        self.shared.changed.notify_all();
     }
 
-    pub mod sim7600 {
-        //! [super::SimModem] Implementation for the `SIMCOM 76XX` range of
-        //! modems.
-
-        use at_commands::{builder::CommandBuilder, parser::CommandParser};
-        use core::fmt::Display;
-        use embedded_svc::io::{BufRead, Read, Write};
-
-        use super::{CommunicationMode, ModemError, SimModem};
-        pub struct SIM7600(CommunicationMode);
-
-        impl SIM7600 {
-            pub fn new() -> Self {
-                Self(CommunicationMode::Command)
+    pub fn wait_connected(&self, timeout: Duration) -> Result<ModemStatus, ModemError> {
+        let deadline = Instant::now() + timeout;
+        let mut status = self.shared.status.lock().unwrap();
+        loop {
+            match status.state {
+                ModemState::Connected => return Ok(status.clone()),
+                ModemState::Failed => {
+                    return Err(status
+                        .last_error
+                        .clone()
+                        .unwrap_or(ModemError::ConnectionLost))
+                }
+                _ => {}
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(ModemError::Timeout("waiting for a PPP address"));
+            }
+            let (next, result) = self
+                .shared
+                .changed
+                .wait_timeout(status, deadline - now)
+                .unwrap();
+            status = next;
+            if result.timed_out() && status.state != ModemState::Connected {
+                return Err(ModemError::Timeout("waiting for a PPP address"));
             }
         }
+    }
+}
 
-        pub enum BitErrorRate {
-            /// < 0.01%
-            LT001,
-            /// 0.01% - 0.1%
-            LT01,
-            /// 0.1% - 0.5%
-            LT05,
-            /// 0.5% - 1%
-            LT1,
-            /// 1% - 2%
-            LT2,
-            /// 2% - 4%
-            LT4,
-            /// 4% - 8%
-            LT8,
-            /// >=8%
-            GT8,
-            /// unknown or undetectable
-            Unknown,
-        }
-        impl Display for BitErrorRate {
-            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                match *self {
-                    BitErrorRate::GT8 => write!(f, ">= 8%"),
-                    BitErrorRate::LT001 => write!(f, "< 0.01%"),
-                    BitErrorRate::LT01 => write!(f, "0.01% - 0.1%"),
-                    BitErrorRate::LT05 => write!(f, "0.1% - 0.5%"),
-                    BitErrorRate::LT1 => write!(f, "0.5% - 1%"),
-                    BitErrorRate::LT2 => write!(f, "1% - 2%"),
-                    BitErrorRate::LT4 => write!(f, "2% - 4%"),
-                    BitErrorRate::LT8 => write!(f, "4% - 8%"),
-                    BitErrorRate::Unknown => write!(f, "Unknown"),
+/// Factory for a runner with exclusive transport ownership and a clonable handle.
+pub struct EspModem;
+
+impl EspModem {
+    #[allow(clippy::new_ret_no_self)]
+    pub fn new<W, R>(
+        config: ModemConfig,
+        writer: W,
+        reader: R,
+        sysloop: EspSystemEventLoop,
+    ) -> Result<(ModemRunner<W, R>, ModemHandle), ModemError>
+    where
+        W: Write + Send + 'static,
+        R: TimedRead + Send + 'static,
+    {
+        config.validate()?;
+        let shared = Arc::new(SharedStatus::new());
+        let writer = Arc::new(Mutex::new(writer));
+        let netif = EspNetif::new(NetifStack::Ppp)?;
+        let raw_handle = netif.handle() as usize;
+
+        let ip_shared = shared.clone();
+        let ip_subscription = sysloop.subscribe::<IpEvent, _>(move |event| {
+            if !event.is_for_handle(raw_handle as _) {
+                return;
+            }
+            match event {
+                IpEvent::DhcpIpAssigned(assignment) => ip_shared.update(|status| {
+                    status.state = ModemState::Connected;
+                    status.ip_info = Some(assignment.ip_info());
+                    status.last_error = None;
+                }),
+                IpEvent::DhcpIpDeassigned(_) => ip_shared.update(|status| {
+                    status.ip_info = None;
+                    if !ip_shared.stop.load(Ordering::SeqCst) {
+                        status.state = ModemState::Recovering;
+                    }
+                }),
+                _ => {}
+            }
+        })?;
+
+        let ppp_shared = shared.clone();
+        let ppp_subscription = sysloop.subscribe::<PppEvent, _>(move |event| {
+            let (phase, error) = map_ppp_event(event);
+            if let Some(phase) = phase {
+                ppp_shared.update(|status| status.phase = phase);
+            }
+            if let Some(error) = error {
+                *ppp_shared.ppp_error.lock().unwrap() = Some(error);
+                if error != ModemPPPError::User || !ppp_shared.stop.load(Ordering::SeqCst) {
+                    ppp_shared.update(|status| status.last_error = Some(ModemError::Ppp(error)));
                 }
             }
+        })?;
+
+        let auth = config.authentication.clone();
+        let tx_writer = writer.clone();
+        let driver = EspNetifDriver::new(
+            netif,
+            move |netif| {
+                netif.set_ppp_conf(&PppConfiguration::default())?;
+                if let Some(auth) = &auth {
+                    let mut protocols = EnumSet::new();
+                    match auth.protocol {
+                        PppAuthProtocol::Pap => {
+                            protocols.insert(PppAuthentication::Pap);
+                        }
+                        PppAuthProtocol::Chap => {
+                            protocols.insert(PppAuthentication::Chap);
+                        }
+                        PppAuthProtocol::PapOrChap => {
+                            protocols.insert(PppAuthentication::Pap);
+                            protocols.insert(PppAuthentication::Chap);
+                        }
+                    }
+                    let username = CString::new(auth.username.as_str()).unwrap();
+                    let password = CString::new(auth.password.as_str()).unwrap();
+                    netif.set_ppp_auth(protocols, &username, &password)?;
+                }
+                Ok(())
+            },
+            move |data| {
+                tx_writer
+                    .lock()
+                    .unwrap()
+                    .write_all(data)
+                    .map_err(|_| EspError::from_infallible::<{ crate::sys::ESP_FAIL }>())
+            },
+        )?;
+
+        let handle = ModemHandle {
+            shared: shared.clone(),
+        };
+        Ok((
+            ModemRunner {
+                config,
+                writer,
+                reader: BufferedTransport::new(reader, 4096),
+                shared,
+                _ip_subscription: ip_subscription,
+                _ppp_subscription: ppp_subscription,
+                driver,
+                connected_since: None,
+            },
+            handle,
+        ))
+    }
+}
+
+pub struct ModemRunner<W, R>
+where
+    W: Write + Send + 'static,
+    R: TimedRead + Send + 'static,
+{
+    config: ModemConfig,
+    writer: Arc<Mutex<W>>,
+    reader: BufferedTransport<R>,
+    shared: Arc<SharedStatus>,
+    _ip_subscription: EspSubscription<'static, System>,
+    _ppp_subscription: EspSubscription<'static, System>,
+    driver: EspNetifDriver<'static, EspNetif>,
+    connected_since: Option<Instant>,
+}
+
+impl<W, R> ModemRunner<W, R>
+where
+    W: Write + Send + 'static,
+    R: TimedRead + Send + 'static,
+{
+    pub fn run(mut self) -> Result<(), ModemError> {
+        self.shared.stop.store(false, Ordering::SeqCst);
+        let mut retry = 0;
+
+        loop {
+            if self.stop_requested() {
+                return self.finish_stop();
+            }
+            *self.shared.ppp_error.lock().unwrap() = None;
+            self.connected_since = None;
+            self.set_state(ModemState::Initializing, None);
+
+            let error = match self.run_session() {
+                Ok(()) => return self.finish_stop(),
+                Err(error) => error,
+            };
+            if self.stop_requested() {
+                return self.finish_stop();
+            }
+            if self
+                .connected_since
+                .is_some_and(|since| since.elapsed() >= Duration::from_secs(60))
+            {
+                retry = 0;
+            }
+            if !error.retryable() || retry == self.config.retry_delays.len() {
+                self.set_state(ModemState::Failed, Some(error.clone()));
+                return Err(error);
+            }
+
+            self.set_state(ModemState::Recovering, Some(error));
+            if let Err(error) = self.recover_command_mode() {
+                self.set_state(ModemState::Failed, Some(error.clone()));
+                return Err(error);
+            }
+            FreeRtos::delay_ms(self.config.retry_delays[retry].as_millis() as u32);
+            retry += 1;
+        }
+    }
+
+    fn run_session(&mut self) -> Result<(), ModemError> {
+        self.synchronize()?;
+        self.command("ATE0", self.config.command_timeout)?;
+        self.command("AT+CMEE=2", self.config.command_timeout)?;
+        self.command("AT+IFC=0,0", self.config.command_timeout)?;
+        self.check_sim()?;
+        if self.stop_requested() {
+            return Ok(());
         }
 
-        impl From<i32> for BitErrorRate {
-            fn from(value: i32) -> Self {
-                match value {
-                    0 => Self::LT001,
-                    1 => Self::LT01,
-                    2 => Self::LT05,
-                    3 => Self::LT1,
-                    4 => Self::LT2,
-                    5 => Self::LT4,
-                    6 => Self::LT8,
-                    7 => Self::GT8,
-                    _ => Self::Unknown,
+        self.set_state(ModemState::Registering, None);
+        self.wait_for_registration()?;
+        if self.stop_requested() {
+            return Ok(());
+        }
+        let context = format!("AT+CGDCONT=1,\"IP\",\"{}\"", self.config.apn);
+        self.command(&context, self.config.command_timeout)?;
+
+        self.set_state(ModemState::Dialing, None);
+        self.dial()?;
+        if self.stop_requested() {
+            return Ok(());
+        }
+        self.set_state(ModemState::NegotiatingPpp, None);
+        self.driver.start()?;
+
+        let deadline = Instant::now() + self.config.ppp_timeout;
+        let mut was_connected = false;
+        let mut buffer = vec![0; 4096];
+        loop {
+            if self.stop_requested() {
+                self.stop_ppp()?;
+                return Ok(());
+            }
+            let ppp_error = self.shared.ppp_error.lock().unwrap().take();
+            if let Some(error) = ppp_error {
+                if error != ModemPPPError::User {
+                    self.stop_ppp()?;
+                    return Err(ModemError::Ppp(error));
                 }
             }
-        }
 
-        /// Received Signal Strength Indication
-        pub enum RSSI {
-            /// -113 dBm or less
-            DBMLT113,
-            /// -111 dBm
-            DBM111,
-            /// -109 to -53 dBm
-            DBM109_53(i32),
-            /// -51 dBm or greater
-            DBMGT51,
-            /// not known or not detectable
-            Unknown,
-            /// -116 dBm or less
-            DBMLT116,
-            /// -115 dBm
-            DBM115,
-            /// -114 to -26 dBm
-            DBM114_26(i32),
-            /// -25 dBm or greater
-            DBMGT25,
-        }
+            let state = self.shared.status.lock().unwrap().state;
+            if state == ModemState::Connected {
+                was_connected = true;
+                self.connected_since.get_or_insert_with(Instant::now);
+            } else if state == ModemState::Recovering && was_connected {
+                self.stop_ppp()?;
+                return Err(ModemError::ConnectionLost);
+            } else if !was_connected && Instant::now() >= deadline {
+                self.stop_ppp()?;
+                return Err(ModemError::Timeout("negotiating PPP"));
+            }
 
-        impl Display for RSSI {
-            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-                match *self {
-                    RSSI::DBMLT113 => write!(f, "<= -113 dBm"),
-                    RSSI::DBM111 => write!(f, "-111 dBm"),
-                    RSSI::DBM109_53(x) => write!(f, "{} dBm", x),
-                    RSSI::DBMGT51 => write!(f, ">= -51 dBm"),
-                    RSSI::DBM114_26(x) => write!(f, "{} dBm", x),
-                    RSSI::DBM115 => write!(f, "-115 dBm"),
-                    RSSI::DBMGT25 => write!(f, ">= -25 dBm"),
-                    RSSI::DBMLT116 => write!(f, "<= -116 dBm"),
-                    RSSI::Unknown => write!(f, "Unknown"),
+            let len = self.reader.read_data(&mut buffer, READ_POLL)?;
+            if len > 0 {
+                self.driver.rx(&buffer[..len])?;
+            }
+        }
+    }
+
+    fn synchronize(&mut self) -> Result<(), ModemError> {
+        for _ in 0..3 {
+            if self.command("AT", self.config.command_timeout).is_ok() {
+                return Ok(());
+            }
+        }
+        Err(ModemError::Timeout("synchronizing with the modem"))
+    }
+
+    fn check_sim(&mut self) -> Result<(), ModemError> {
+        let lines = self.command("AT+CPIN?", self.config.command_timeout)?;
+        let state = find_value(&lines, "+CPIN:").unwrap_or_default();
+        if state == "READY" {
+            return Ok(());
+        }
+        if state != "SIM PIN" {
+            return Err(ModemError::SimPinRejected);
+        }
+        let pin = self.config.pin.clone().ok_or(ModemError::SimPinRequired)?;
+        self.command(&format!("AT+CPIN=\"{pin}\""), self.config.command_timeout)
+            .map_err(|_| ModemError::SimPinRejected)?;
+        Ok(())
+    }
+
+    fn wait_for_registration(&mut self) -> Result<(), ModemError> {
+        let deadline = Instant::now() + self.config.registration_timeout;
+        let mut command = "AT+CEREG?";
+        loop {
+            match self.command(command, self.config.command_timeout) {
+                Ok(lines) => {
+                    let prefix = if command == "AT+CEREG?" {
+                        "+CEREG:"
+                    } else {
+                        "+CGREG:"
+                    };
+                    if let Some(status) = find_value(&lines, prefix).and_then(registration_status) {
+                        match status {
+                            1 | 5 => return Ok(()),
+                            3 => return Err(ModemError::RegistrationDenied),
+                            _ => {}
+                        }
+                    }
                 }
+                Err(ModemError::At(_)) if command == "AT+CEREG?" => command = "AT+CGREG?",
+                Err(error) => return Err(error),
+            }
+            if self.stop_requested() {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(ModemError::Timeout("waiting for cellular registration"));
+            }
+            FreeRtos::delay_ms(1000);
+        }
+    }
+
+    fn dial(&mut self) -> Result<(), ModemError> {
+        self.write_raw(b"ATD*99***1#\r")?;
+        let deadline = Instant::now() + self.config.dial_timeout;
+        loop {
+            let line = self.reader.read_line(deadline, "dialing the modem")?;
+            let line = String::from_utf8_lossy(&line);
+            let line = line.trim();
+            if line == "CONNECT" || line.starts_with("CONNECT ") {
+                return Ok(());
+            }
+            if is_at_error(line) {
+                return Err(ModemError::At(line.into()));
             }
         }
+    }
 
-        impl RSSI {
-            pub fn parse(raw: i32) -> RSSI {
-                match raw {
-                    0 => Self::DBMLT113,
-                    1 => Self::DBM111,
-                    2..=30 => Self::DBM109_53(RSSI::map2_30_to_109_53(raw)),
-                    31 => Self::DBMGT51,
-                    99 => Self::Unknown,
-                    100 => Self::DBMLT116,
-                    101 => Self::DBM115,
-                    102..=191 => Self::DBM114_26(RSSI::map102_191_to_114_26(raw)),
-                    _ => Self::Unknown,
-                }
+    fn command(&mut self, command: &str, timeout: Duration) -> Result<Vec<String>, ModemError> {
+        self.write_raw(command.as_bytes())?;
+        self.write_raw(b"\r")?;
+        let deadline = Instant::now() + timeout;
+        let mut lines = Vec::new();
+        loop {
+            let line = self
+                .reader
+                .read_line(deadline, "waiting for an AT response")?;
+            let line = String::from(String::from_utf8_lossy(&line).trim());
+            if line.is_empty() || line == command {
+                continue;
             }
-
-            fn map2_30_to_109_53(raw: i32) -> i32 {
-                const X1: i32 = 2;
-                const Y1: i32 = -109;
-                const X2: i32 = 30;
-                const Y2: i32 = -53;
-                const GRAD: i32 = (Y2 - Y1) / (X2 - X1); // 56/28 = 2
-                const OFFSET: i32 = Y1 - (GRAD * X1); // -113
-                (GRAD * raw) + OFFSET
+            if line == "OK" {
+                return Ok(lines);
             }
+            if is_at_error(&line) {
+                return Err(ModemError::At(line));
+            }
+            lines.push(line);
+        }
+    }
 
-            fn map102_191_to_114_26(raw: i32) -> i32 {
-                const X1: i32 = 102;
-                const Y1: i32 = -114;
-                // const X2: i32 = 191;
-                // const Y2: i32 = -26;
-                const GRAD: i32 = 1;
-                // requires #![feature(int_roundings)]
-                // const GRAD: i32 = (Y2 - Y1).div_ceil((X2 - X1)); // would be 88/89, so truncated to 0
-                const OFFSET: i32 = Y1 - (GRAD * X1); // -216
-                (GRAD * raw) + OFFSET
+    fn write_raw(&self, data: &[u8]) -> Result<(), ModemError> {
+        self.writer
+            .lock()
+            .unwrap()
+            .write_all(data)
+            .map_err(|_| ModemError::Io)
+    }
+
+    fn stop_ppp(&mut self) -> Result<(), ModemError> {
+        if !self.driver.is_started()? {
+            return Ok(());
+        }
+        self.set_state(ModemState::Stopping, None);
+        self.driver.stop()?;
+        let deadline = Instant::now() + self.config.shutdown_timeout;
+        let mut buffer = [0; 512];
+        while Instant::now() < deadline {
+            if self.shared.status.lock().unwrap().phase == ModemPhaseStatus::Dead {
+                return Ok(());
+            }
+            let len = self.reader.read_data(&mut buffer, READ_POLL)?;
+            if len > 0 {
+                self.driver.rx(&buffer[..len])?;
             }
         }
+        Err(ModemError::ShutdownTimeout)
+    }
 
-        impl Default for SIM7600 {
-            fn default() -> Self {
-                Self::new()
-            }
+    fn recover_command_mode(&mut self) -> Result<(), ModemError> {
+        if self.driver.is_started()? {
+            self.stop_ppp()?;
+        }
+        self.reader.discard_pending();
+        if self.command("AT", Duration::from_secs(1)).is_ok() {
+            let _ = self.command("ATH", self.config.command_timeout);
+            return Ok(());
         }
 
-        impl SimModem for SIM7600 {
-            fn negotiate<T: Write, R: BufRead + Read>(
-                &mut self,
-                tx: &mut T,
-                rx: &mut R,
-            ) -> Result<(), ModemError> {
-                let mut buffer = [0u8; 64];
-                reset(tx, rx, &mut buffer)?;
+        FreeRtos::delay_ms(ESCAPE_GUARD_MS);
+        self.write_raw(b"+++")?;
+        FreeRtos::delay_ms(ESCAPE_GUARD_MS);
+        self.reader.discard_pending();
+        self.command("AT", self.config.command_timeout)
+            .map_err(|_| ModemError::RecoveryRequired)?;
+        let _ = self.command("ATH", self.config.command_timeout);
+        Ok(())
+    }
 
-                //disable echo
-                set_echo(tx, rx, &mut buffer, false)?;
-
-                // get signal quality
-                let (rssi, ber) = get_signal_quality(tx, rx, &mut buffer)?;
-                log::info!("RSSI = {rssi}");
-                log::info!("BER = {ber}");
-                // get iccid
-                let iccid = get_iccid(tx, rx, &mut buffer)?;
-                log::info!("ICCID = [{}]", iccid);
-
-                // check pdp network reg
-                read_gprs_registration_status(tx, rx, &mut buffer)?;
-
-                //configure apn
-                set_pdp_context(tx, rx, &mut buffer)?;
-
-                // start ppp
-                set_data_mode(tx, rx, &mut buffer)?;
-
-                self.0 = CommunicationMode::Data;
+    fn finish_stop(&mut self) -> Result<(), ModemError> {
+        match self.stop_ppp() {
+            Ok(()) => {
+                self.set_state(ModemState::Stopped, None);
                 Ok(())
             }
-
-            fn get_mode(&self) -> &CommunicationMode {
-                &self.0
+            Err(error) => {
+                self.set_state(ModemState::Failed, Some(error.clone()));
+                Err(error)
             }
         }
+    }
 
-        pub fn get_signal_quality<T: embedded_svc::io::Write, R: embedded_svc::io::BufRead>(
-            tx: &mut T,
-            rx: &mut R,
-            buff: &mut [u8],
-        ) -> Result<(RSSI, BitErrorRate), ModemError> {
-            let cmd = CommandBuilder::create_execute(buff, true)
-                .named("+CSQ")
-                .finish()?;
+    fn set_state(&self, state: ModemState, error: Option<ModemError>) {
+        self.shared.update(|status| {
+            status.state = state;
+            status.last_error = error;
+            if state != ModemState::Connected {
+                status.ip_info = None;
+            }
+        });
+    }
 
-            tx.write(cmd).map_err(|_| ModemError::IO)?;
+    fn stop_requested(&self) -> bool {
+        self.shared.stop.load(Ordering::SeqCst)
+    }
+}
 
-            let len = rx
-                .fill_buf()
-                .map_err(|_| ModemError::IO)?
-                .read(buff)
-                .map_err(|_| ModemError::IO)?;
+struct BufferedTransport<R> {
+    inner: R,
+    buffer: Vec<u8>,
+    start: usize,
+    end: usize,
+}
 
-            log::info!("got response{:?}", std::str::from_utf8(&buff[..len]));
-
-            // \r\n+CSQ: 19,99\r\n\r\nOK\r\n
-            let (raw_rssi, raw_ber) = CommandParser::parse(&buff[..len])
-                .expect_identifier(b"\r\n+CSQ: ")
-                .expect_int_parameter()
-                .expect_int_parameter()
-                .expect_identifier(b"\r\n\r\nOK\r\n")
-                .finish()?;
-            rx.consume(len);
-
-            Ok((RSSI::parse(raw_rssi), raw_ber.into()))
+impl<R: TimedRead> BufferedTransport<R> {
+    fn new(inner: R, capacity: usize) -> Self {
+        Self {
+            inner,
+            buffer: vec![0; capacity],
+            start: 0,
+            end: 0,
         }
+    }
 
-        fn get_iccid<T: embedded_svc::io::Write, R: embedded_svc::io::BufRead>(
-            tx: &mut T,
-            rx: &mut R,
-            buff: &mut [u8],
-        ) -> Result<heapless::String<22>, ModemError> {
-            let cmd = CommandBuilder::create_execute(buff, true)
-                .named("+CICCID")
-                .finish()?;
-
-            tx.write(cmd).map_err(|_| ModemError::IO)?;
-
-            let len = rx
-                .fill_buf()
-                .map_err(|_| ModemError::IO)?
-                .read(buff)
-                .map_err(|_| ModemError::IO)?;
-            log::info!("got response{:?}", std::str::from_utf8(&buff[..len]));
-
-            let (ccid,) = CommandParser::parse(&buff[..len])
-                .expect_identifier(b"\r\n+ICCID: ")
-                .expect_raw_string()
-                .expect_identifier(b"\r\n\r\nOK\r\n")
-                .finish()?;
-            rx.consume(len);
-            Ok(heapless::String::try_from(ccid).unwrap())
-        }
-
-        fn reset<T: Write, R: Read>(
-            tx: &mut T,
-            rx: &mut R,
-            buff: &mut [u8],
-        ) -> Result<(), ModemError> {
-            let cmd = CommandBuilder::create_execute(buff, false)
-                .named("ATZ0")
-                .finish()?;
-            log::info!("Send Reset");
-
-            tx.write(cmd).map_err(|_| ModemError::IO)?;
-
-            // not sure if I need this or not
-            let len = rx.read(buff).map_err(|_| ModemError::IO)?;
-            log::info!("got response{:?}", std::str::from_utf8(&buff[..len]));
-            if CommandParser::parse(&buff[..len])
-                .expect_identifier(b"ATZ0\r")
-                .expect_identifier(b"\r\nOK\r\n")
-                .finish()
-                .is_err()
+    fn read_line(
+        &mut self,
+        deadline: Instant,
+        operation: &'static str,
+    ) -> Result<Vec<u8>, ModemError> {
+        loop {
+            if let Some(relative_end) = self.buffer[self.start..self.end]
+                .iter()
+                .position(|byte| *byte == b'\n')
             {
-                CommandParser::parse(&buff[..len])
-                    .expect_identifier(b"ATZ0\r")
-                    .expect_identifier(b"\r\nERROR\r\n")
-                    .finish()?
+                let line_end = self.start + relative_end + 1;
+                let mut content_end = line_end - 1;
+                if content_end > self.start && self.buffer[content_end - 1] == b'\r' {
+                    content_end -= 1;
+                }
+                let line = self.buffer[self.start..content_end].to_vec();
+                self.start = line_end;
+                if self.start == self.end {
+                    self.start = 0;
+                    self.end = 0;
+                }
+                return Ok(line);
             }
-            Ok(())
-        }
-
-        fn set_echo<T: Write, R: Read>(
-            tx: &mut T,
-            rx: &mut R,
-            buff: &mut [u8],
-            echo: bool,
-        ) -> Result<(), ModemError> {
-            let cmd = CommandBuilder::create_execute(buff, false)
-                .named(format!("ATE{}", i32::from(echo)))
-                .finish()?;
-            log::info!("Set echo ");
-            tx.write(cmd).map_err(|_| ModemError::IO)?;
-
-            let len = rx.read(buff).map_err(|_| ModemError::IO)?;
-            log::info!("got response{:?}", std::str::from_utf8(&buff[..len]));
-
-            Ok(CommandParser::parse(&buff[..len])
-                .expect_identifier(b"ATE0\r")
-                .expect_identifier(b"\r\nOK\r\n")
-                .finish()?)
-        }
-
-        fn read_gprs_registration_status<T: Write, R: Read>(
-            tx: &mut T,
-            rx: &mut R,
-            buff: &mut [u8],
-        ) -> Result<(i32, i32, Option<i32>, Option<i32>), ModemError> {
-            let cmd = CommandBuilder::create_query(buff, true)
-                .named("+CGREG")
-                .finish()?;
-            log::info!("Get Registration Status");
-            tx.write(cmd).map_err(|_| ModemError::IO)?;
-            let len = rx.read(buff).map_err(|_| ModemError::IO)?;
-            log::info!("got response{:?}", std::str::from_utf8(&buff[..len]));
-
-            Ok(CommandParser::parse(&buff[..len])
-                .expect_identifier(b"\r\n+CGREG: ")
-                .expect_int_parameter()
-                .expect_int_parameter()
-                .expect_optional_int_parameter()
-                .expect_optional_int_parameter()
-                .expect_identifier(b"\r\n\r\nOK\r\n")
-                .finish()?)
-        }
-
-        fn set_pdp_context<T: Write, R: Read>(
-            tx: &mut T,
-            rx: &mut R,
-            buff: &mut [u8],
-        ) -> Result<(), ModemError> {
-            let cmd = CommandBuilder::create_set(buff, true)
-                .named("+CGDCONT")
-                .with_int_parameter(1) // context id
-                .with_string_parameter("IP") // pdp type
-                .with_string_parameter("flolive.net") // apn
-                .finish()?;
-            log::info!("Set PDP Context");
-            tx.write(cmd).map_err(|_| ModemError::IO)?;
-            let len = rx.read(buff).map_err(|_| ModemError::IO)?;
-            log::info!("got response{:?}", std::str::from_utf8(&buff[..len]));
-
-            Ok(CommandParser::parse(&buff[..len])
-                .expect_identifier(b"\r\nOK\r\n")
-                .finish()?)
-        }
-
-        fn set_data_mode<T: Write, R: BufRead + Read>(
-            tx: &mut T,
-            rx: &mut R,
-            buff: &mut [u8],
-        ) -> Result<(), ModemError> {
-            let cmd = CommandBuilder::create_execute(buff, false)
-                .named("ATD*99#")
-                .finish()?;
-            log::info!("Set Data mode");
-            tx.write(cmd).map_err(|_| ModemError::IO)?;
-
-            let len = rx
-                .fill_buf()
-                .map_err(|_| ModemError::IO)?
-                .read(buff)
-                .map_err(|_| ModemError::IO)?;
-
-            log::info!("got response{:?}", std::str::from_utf8(&buff[..len]));
-
-            let (connect_parm,) = CommandParser::parse(&buff[..len])
-                .expect_identifier(b"\r\nCONNECT ")
-                .expect_optional_raw_string()
-                .expect_identifier(b"\r\n")
-                .finish()?;
-            log::info!("connect {:?}", connect_parm);
-            // consume only pre-PPP bytes from the buffer
-            rx.consume(10);
-            if let Some(connect_str) = connect_parm {
-                rx.consume(connect_str.len());
+            if Instant::now() >= deadline {
+                return Err(ModemError::Timeout(operation));
             }
-            rx.consume(2);
-            Ok(())
+            self.compact();
+            if self.end == self.buffer.len() {
+                return Err(ModemError::BufferOverflow);
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = core::cmp::min(READ_POLL, remaining);
+            let len = self
+                .inner
+                .read_timeout(&mut self.buffer[self.end..], timeout)
+                .map_err(|_| ModemError::Io)?;
+            self.end += len;
         }
+    }
+
+    fn read_data(&mut self, output: &mut [u8], timeout: Duration) -> Result<usize, ModemError> {
+        if self.start < self.end {
+            let len = core::cmp::min(output.len(), self.end - self.start);
+            output[..len].copy_from_slice(&self.buffer[self.start..self.start + len]);
+            self.start += len;
+            if self.start == self.end {
+                self.start = 0;
+                self.end = 0;
+            }
+            return Ok(len);
+        }
+        self.inner
+            .read_timeout(output, timeout)
+            .map_err(|_| ModemError::Io)
+    }
+
+    fn compact(&mut self) {
+        if self.start > 0 {
+            self.buffer.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
+        }
+    }
+
+    fn discard_pending(&mut self) {
+        self.start = 0;
+        self.end = 0;
+    }
+}
+
+fn validate_at_argument(name: &str, value: &str) -> Result<(), ModemError> {
+    if value
+        .bytes()
+        .any(|byte| matches!(byte, b'"' | b'\r' | b'\n' | 0))
+    {
+        return Err(ModemError::Configuration(format!(
+            "{name} contains a character which cannot be used in an AT command"
+        )));
+    }
+    Ok(())
+}
+
+fn is_at_error(line: &str) -> bool {
+    line == "ERROR"
+        || line == "NO CARRIER"
+        || line.starts_with("+CME ERROR")
+        || line.starts_with("+CMS ERROR")
+}
+
+fn find_value<'a>(lines: &'a [String], prefix: &str) -> Option<&'a str> {
+    lines
+        .iter()
+        .find_map(|line| line.strip_prefix(prefix).map(str::trim))
+}
+
+fn registration_status(value: &str) -> Option<u8> {
+    value
+        .split(',')
+        .nth(1)
+        .or_else(|| value.split(',').next())?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn map_ppp_event(event: PppEvent) -> (Option<ModemPhaseStatus>, Option<ModemPPPError>) {
+    match event {
+        PppEvent::NoError => (None, None),
+        PppEvent::ParameterError => (None, Some(ModemPPPError::Parameter)),
+        PppEvent::OpenError => (None, Some(ModemPPPError::Open)),
+        PppEvent::DeviceError => (None, Some(ModemPPPError::Device)),
+        PppEvent::AllocError => (None, Some(ModemPPPError::Alloc)),
+        PppEvent::UserError => (None, Some(ModemPPPError::User)),
+        PppEvent::DisconnectError => (None, Some(ModemPPPError::Disconnect)),
+        PppEvent::AuthFailError => (None, Some(ModemPPPError::AuthFail)),
+        PppEvent::ProtocolError => (None, Some(ModemPPPError::Protocol)),
+        PppEvent::PeerDeadError => (None, Some(ModemPPPError::PeerDead)),
+        PppEvent::IdleTimeoutError => (None, Some(ModemPPPError::IdleTimeout)),
+        PppEvent::MaxConnectTimeoutError => (None, Some(ModemPPPError::MaxConnectTimeout)),
+        PppEvent::LoopbackError => (None, Some(ModemPPPError::Loopback)),
+        PppEvent::PhaseDead => (Some(ModemPhaseStatus::Dead), None),
+        PppEvent::PhaseMaster => (Some(ModemPhaseStatus::Master), None),
+        PppEvent::PhaseHoldoff => (Some(ModemPhaseStatus::Holdoff), None),
+        PppEvent::PhaseInitialize => (Some(ModemPhaseStatus::Initialize), None),
+        PppEvent::PhaseSerialConnection => (Some(ModemPhaseStatus::SerialConnection), None),
+        PppEvent::PhaseDormant => (Some(ModemPhaseStatus::Dormant), None),
+        PppEvent::PhaseEstablish => (Some(ModemPhaseStatus::Establish), None),
+        PppEvent::PhaseAuthenticate => (Some(ModemPhaseStatus::Authenticate), None),
+        PppEvent::PhaseCallback => (Some(ModemPhaseStatus::Callback), None),
+        PppEvent::PhaseNetwork => (Some(ModemPhaseStatus::Network), None),
+        PppEvent::PhaseRunning => (Some(ModemPhaseStatus::Running), None),
+        PppEvent::PhaseTerminate => (Some(ModemPhaseStatus::Terminate), None),
+        PppEvent::PhaseDisconnect => (Some(ModemPhaseStatus::Disconnect), None),
+        PppEvent::PhaseFailed => (Some(ModemPhaseStatus::Failed), None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ScriptedReader {
+        chunks: Vec<Vec<u8>>,
+    }
+
+    impl ErrorType for ScriptedReader {
+        type Error = core::convert::Infallible;
+    }
+
+    impl TimedRead for ScriptedReader {
+        fn read_timeout(
+            &mut self,
+            output: &mut [u8],
+            _timeout: Duration,
+        ) -> Result<usize, Self::Error> {
+            if self.chunks.is_empty() {
+                return Ok(0);
+            }
+            let chunk = self.chunks.remove(0);
+            let len = core::cmp::min(chunk.len(), output.len());
+            output[..len].copy_from_slice(&chunk[..len]);
+            if len < chunk.len() {
+                self.chunks.insert(0, chunk[len..].to_vec());
+            }
+            Ok(len)
+        }
+    }
+
+    #[test]
+    fn fragmented_lines_preserve_binary_data_after_connect() {
+        let reader = ScriptedReader {
+            chunks: vec![b"\r\nCON".to_vec(), b"NECT 115200\r\n~\xff}".to_vec()],
+        };
+        let mut reader = BufferedTransport::new(reader, 64);
+        assert!(reader
+            .read_line(Instant::now() + Duration::from_secs(1), "test")
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            reader
+                .read_line(Instant::now() + Duration::from_secs(1), "test")
+                .unwrap(),
+            b"CONNECT 115200"
+        );
+        let mut ppp = [0; 8];
+        let len = reader.read_data(&mut ppp, READ_POLL).unwrap();
+        assert_eq!(&ppp[..len], b"~\xff}");
+    }
+
+    #[test]
+    fn registration_response_parsing_handles_common_forms() {
+        assert_eq!(registration_status("0,1"), Some(1));
+        assert_eq!(registration_status("5"), Some(5));
+        assert_eq!(registration_status("2,3,\"1234\""), Some(3));
+    }
+
+    #[test]
+    fn at_arguments_reject_command_injection() {
+        assert!(validate_at_argument("APN", "internet").is_ok());
+        assert!(validate_at_argument("APN", "internet\rAT+CFUN=0").is_err());
+        assert!(validate_at_argument("PIN", "12\"34").is_err());
     }
 }

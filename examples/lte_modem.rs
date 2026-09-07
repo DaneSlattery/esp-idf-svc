@@ -1,8 +1,8 @@
-//! Example of using blocking wifi.
+//! Connect a SIM7600 to lwIP using PPP over UART.
 //!
-//! Add your own ssid and password
+//! Set `CELLULAR_APN` at compile time. If it is absent, `internet` is used.
 
-use std::{thread::ScopedJoinHandle, time::Duration};
+use std::time::Duration;
 
 use embedded_svc::{
     http::{client::Client as HttpClient, Method},
@@ -15,17 +15,17 @@ use esp_idf_hal::{
     delay,
     gpio::{self, PinDriver},
 };
-use esp_idf_svc::modem::sim::sim7600::SIM7600;
-use esp_idf_svc::modem::sim::SimModem;
-use esp_idf_svc::modem::EspModem;
-use esp_idf_svc::{eventloop::EspSystemEventLoop, modem::BufferedRead};
+use esp_idf_svc::eventloop::EspSystemEventLoop;
+use esp_idf_svc::log::EspLogger;
+use esp_idf_svc::modem::{EspModem, ModemConfig};
 use esp_idf_svc::{hal::prelude::Peripherals, http::client::EspHttpConnection};
-use esp_idf_svc::{log::EspLogger, modem::ModemPhaseStatus};
 
 use log::{error, info};
 
-// const SSID: &str = env!("WIFI_SSID");
-// const PASSWORD: &str = env!("WIFI_PASS");
+const APN: &str = match option_env!("CELLULAR_APN") {
+    Some(apn) => apn,
+    None => "internet",
+};
 
 fn main() -> anyhow::Result<()> {
     esp_idf_svc::sys::link_patches();
@@ -54,7 +54,7 @@ fn main() -> anyhow::Result<()> {
     delay.delay_ms(10000);
     log::info!("Reset Complete");
 
-    let mut serial = UartDriver::new(
+    let serial = UartDriver::new(
         serial,
         tx,
         rx,
@@ -66,50 +66,24 @@ fn main() -> anyhow::Result<()> {
         },
     )?;
 
-    let mut buff = [0u8; 1024];
+    let (tx, rx) = serial.into_split();
+    let (runner, handle) = EspModem::new(ModemConfig::new(APN), tx, rx, sys_loop)?;
+    let worker = std::thread::spawn(move || runner.run());
 
-    let (mut tx, rx) = serial.split();
-
-    let mut buf_reader = BufferedRead::new(rx, &mut buff);
-
-    let mut sim_device = SIM7600::new();
-
-    match sim_device.negotiate(&mut tx, &mut buf_reader) {
-        Err(x) => log::error!("Error = {}", x),
-        Ok(()) => log::info!("Device in PPP mode"),
-    }
-
-    let modem = EspModem::new(&mut tx, &mut buf_reader, sys_loop)?;
-
-    let _scope = std::thread::scope::<_, anyhow::Result<()>>(|s| {
-        let my_thread: ScopedJoinHandle<anyhow::Result<()>> = s.spawn(|| {
-            let mut buff = [0u8; 64];
-
-            match modem.run(&mut buff) {
-                Err(x) => log::error!("Error: {:?}", x),
-                Ok(_x) => (),
-            };
-            Ok(())
-        });
-        std::thread::sleep(Duration::from_secs(10));
+    let application_result = (|| -> anyhow::Result<()> {
+        let status = handle.wait_connected(Duration::from_secs(240))?;
+        info!("PPP connected: {:?}", status.ip_info);
 
         let mut client = HttpClient::wrap(EspHttpConnection::new(&Default::default())?);
+        get_request(&mut client)
+    })();
 
-        // GET
-        loop {
-            std::thread::sleep(Duration::from_secs(10));
-            match get_request(&mut client) {
-                Err(x) => log::error!("Failed, reason = {}", x),
-                Ok(_) => break,
-            }
-        }
-        my_thread.join().unwrap()?;
-        Ok(())
-    });
-
-    std::thread::sleep(core::time::Duration::from_secs(5));
-
-    Ok(())
+    handle.request_stop();
+    let runner_result = worker
+        .join()
+        .map_err(|_| anyhow::anyhow!("modem task panicked"))?;
+    runner_result?;
+    application_result
 }
 
 /// Send an HTTP GET request.
